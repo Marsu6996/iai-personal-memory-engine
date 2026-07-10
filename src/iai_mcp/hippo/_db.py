@@ -44,6 +44,7 @@ _log = logging.getLogger(__name__)
 # operator-overridable; a non-positive / malformed value disables that bound.
 REEMBED_BATCH_SIZE_DEFAULT = 128
 REEMBED_RSS_SOFT_CAP_DEFAULT_BYTES = 2_684_354_560
+REEMBED_TIME_BUDGET_DEFAULT_SEC = 20.0
 
 
 def _reembed_batch_size() -> int:
@@ -66,6 +67,17 @@ def _reembed_rss_soft_cap() -> int:
     except (TypeError, ValueError):
         return REEMBED_RSS_SOFT_CAP_DEFAULT_BYTES
     return val if val > 0 else 0
+
+
+def _reembed_time_budget_sec() -> float:
+    raw = os.environ.get("IAI_MCP_REEMBED_TIME_BUDGET_SEC")
+    if raw is None:
+        return REEMBED_TIME_BUDGET_DEFAULT_SEC
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return REEMBED_TIME_BUDGET_DEFAULT_SEC
+    return val if val > 0 else 0.0
 
 
 _txn_owners: dict[int, int] = {}
@@ -667,8 +679,9 @@ class HippoDB:
         *,
         batch_size: int = 0,
         rss_soft_cap_bytes: int = 0,
+        time_budget_sec: float = 0.0,
     ) -> int:
-        """Embed pending rows, optionally bounded by batch size and resident set.
+        """Embed pending rows, optionally bounded by batch size, RSS, and time.
 
         The deferred-embed pass of the two-phase capture drain. With the defaults
         (both bounds 0) it embeds every pending row in one pass — the historical
@@ -682,6 +695,8 @@ class HippoDB:
         resident set exceeds the cap — the remaining rows stay pending for the
         next cycle, exactly like the drain's own soft cap. This keeps a large
         deferred backlog from climbing the resident set through one long run.
+        When ``time_budget_sec`` is positive the pass also yields after the
+        current row once the elapsed wall time crosses that budget.
         """
         import struct as _struct
 
@@ -700,10 +715,22 @@ class HippoDB:
 
         window = batch_size if batch_size and batch_size > 0 else len(ids)
         soft_cap = rss_soft_cap_bytes if rss_soft_cap_bytes and rss_soft_cap_bytes > 0 else 0
+        time_budget = time_budget_sec if time_budget_sec and time_budget_sec > 0 else 0.0
+        deadline = time.monotonic() + time_budget if time_budget > 0 else 0.0
         bounded = bool(batch_size and batch_size > 0)
 
         count = 0
+        stop_due_to_time = False
         for start in range(0, len(ids), window):
+            if deadline and count > 0 and time.monotonic() >= deadline:
+                _log.info(
+                    "reembed_pending_rows: time budget hit (budget=%.3fs),"
+                    " %d rows left pending",
+                    time_budget,
+                    len(ids) - start,
+                )
+                break
+
             # Soft resident-memory ceiling — checked before reading the next
             # window so the pass yields with the remaining rows still pending
             # (deferred, not lost). A 0 reading (psutil unavailable) is treated as
@@ -722,10 +749,11 @@ class HippoDB:
 
             window_ids = ids[start:start + window]
             window_count = 0
+            index_rows: list[tuple[str, int, list[float]]] = []
             for rid in window_ids:
                 with self._conn_lock:
                     row = self._conn.execute(
-                        "SELECT literal_surface FROM records WHERE id = ?",
+                        "SELECT literal_surface, vec_label FROM records WHERE id = ?",
                         (rid,),
                     ).fetchone()
                 if row is None:
@@ -765,15 +793,44 @@ class HippoDB:
                     )
                 count += 1
                 window_count += 1
+                index_rows.append((rid, int(row["vec_label"]), vec))
+                if deadline and time.monotonic() >= deadline:
+                    stop_due_to_time = True
+                    _log.info(
+                        "reembed_pending_rows: time budget hit (budget=%.3fs),"
+                        " %d rows left pending",
+                        time_budget,
+                        len(ids) - count,
+                    )
+                    break
 
             if window_count > 0:
                 with self._conn_lock:
                     self._conn.commit()
+                try:
+                    with self._hnsw_lock:
+                        self._maybe_resize()
+                        self._hnsw.add_items(
+                            np.asarray([item[2] for item in index_rows], dtype=np.float32),
+                            np.asarray([item[1] for item in index_rows], dtype=np.int64),
+                        )
+                        for rid, vec_label, _vec in index_rows:
+                            self._label_map[rid] = vec_label
+                        self._write_counter += len(index_rows)
+                        self._save_index_atomic()
+                except Exception as exc:  # noqa: BLE001 -- mismatch repair runs below
+                    _log.warning(
+                        "reembed_pending_rows: incremental index update failed: %s",
+                        exc,
+                    )
 
             # Hand the per-window embedder/columnar transient back to the OS
             # between windows so the bounded pass does not build a warm plateau.
             if bounded and window_count > 0:
                 self._reembed_window_relief()
+
+            if stop_due_to_time:
+                break
 
         return count
 
@@ -872,13 +929,27 @@ class HippoDB:
                 embedder,
                 batch_size=_reembed_batch_size(),
                 rss_soft_cap_bytes=_reembed_rss_soft_cap(),
+                time_budget_sec=_reembed_time_budget_sec(),
             )
 
         ingest_count = 0
         if has_sidecars:
             ingest_count = self.ingest_pending_embeddings()
 
-        rebuild_result = self._rebuild_index_from_sqlite()
+        changed = reembed_count > 0 or ingest_count > 0
+        with self._conn_lock:
+            ready_row = self._conn.execute(
+                "SELECT COUNT(*) FROM records"
+                " WHERE tombstoned_at IS NULL"
+                " AND COALESCE(embedding_pending, 0) = 0"
+            ).fetchone()
+        ready_count = ready_row[0] if ready_row else 0
+        has_mismatch = len(self._label_map) != ready_count
+        rebuild_result = (
+            self._rebuild_index_from_sqlite()
+            if has_mismatch
+            else {"action": "skip", "reason": "unchanged"}
+        )
 
         # A pending->ready transition (a row flipping embedding_pending 1->0, or a
         # sidecar embedding landing) adds an active, index-findable row whose +1
@@ -889,7 +960,7 @@ class HippoDB:
         # rebuild. Invalidate at the data-operation boundary so every caller of
         # the wake sequence — not just the daemon — forces the row into the next
         # warm graph. The unlink is key-free; the AES fence is untouched.
-        if reembed_count > 0 or ingest_count > 0:
+        if changed:
             try:
                 from iai_mcp import runtime_graph_cache as _rgc
                 _rgc.invalidate_at_root(self._store_root)

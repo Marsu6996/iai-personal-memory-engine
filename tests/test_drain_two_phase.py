@@ -361,3 +361,111 @@ def test_deferred_embed_pass_honors_rss_soft_cap(iai_home, monkeypatch):
     embedded2 = store.db.reembed_pending_rows(spy2, batch_size=3, rss_soft_cap_bytes=0)
     assert embedded2 == n - 3, embedded2
     assert _count_pending(store) == 0, _count_pending(store)
+
+
+def test_deferred_embed_pass_honors_time_budget(iai_home, monkeypatch):
+    from iai_mcp.capture import drain_deferred_captures
+    from iai_mcp.hippo import _db as hippo_db
+
+    store = _open_store()
+
+    n = 6
+    events = [
+        _make_event(
+            f"pending turn for the time-capped embed pass number {i} long enough",
+            ts=f"2026-07-04T05:{i:02d}:00Z",
+            source_uuid=str(uuid.uuid4()),
+        )
+        for i in range(n)
+    ]
+    _write_backlog(iai_home, events)
+    drain_deferred_captures(store)
+    assert _count_pending(store) == n
+
+    ticks = iter([0.0, 0.5, 3.0])
+    last = 3.0
+
+    def fake_monotonic() -> float:
+        nonlocal last
+        try:
+            last = next(ticks)
+        except StopIteration:
+            pass
+        return last
+
+    monkeypatch.setattr(hippo_db.time, "monotonic", fake_monotonic)
+
+    spy = _SpyEmbedder()
+    embedded = store.db.reembed_pending_rows(
+        spy,
+        batch_size=6,
+        rss_soft_cap_bytes=0,
+        time_budget_sec=2.0,
+    )
+
+    assert embedded == 2, embedded
+    assert len(spy.calls) == 2, spy.calls
+    assert _count_pending(store) == n - 2
+
+
+def test_wake_sequence_does_not_rebuild_when_pending_cannot_advance(iai_home, monkeypatch):
+    from iai_mcp.capture import drain_deferred_captures
+    from iai_mcp.hippo import HippoDB
+
+    store = _open_store()
+    _write_backlog(
+        iai_home,
+        [_make_event(
+            "pending turn with no available embedder must stay cheap",
+            ts="2026-07-04T06:00:00Z",
+            source_uuid=str(uuid.uuid4()),
+        )],
+    )
+    drain_deferred_captures(store)
+    assert _count_pending(store) == 1
+
+    rebuild_calls: list[int] = []
+    monkeypatch.setattr(
+        HippoDB,
+        "_rebuild_index_from_sqlite",
+        lambda self: rebuild_calls.append(1) or {"action": "rebuild"},
+    )
+
+    result = store.db.pending_embeddings_wake_sequence(embedder=None)
+
+    assert result["reembed_count"] == 0
+    assert result["ingest_count"] == 0
+    assert result["rebuild"] == {"action": "skip", "reason": "unchanged"}
+    assert rebuild_calls == []
+
+
+def test_wake_sequence_indexes_reembedded_rows_without_full_rebuild(iai_home, monkeypatch):
+    from iai_mcp.capture import drain_deferred_captures
+    from iai_mcp.hippo import HippoDB
+
+    store = _open_store()
+    _write_backlog(
+        iai_home,
+        [_make_event(
+            "pending turn promoted directly into the live index",
+            ts="2026-07-04T07:00:00Z",
+            source_uuid=str(uuid.uuid4()),
+        )],
+    )
+    drain_deferred_captures(store)
+
+    rebuild_calls: list[int] = []
+    monkeypatch.setattr(
+        HippoDB,
+        "_rebuild_index_from_sqlite",
+        lambda self: rebuild_calls.append(1) or {"action": "rebuild"},
+    )
+
+    result = store.db.pending_embeddings_wake_sequence(embedder=_SpyEmbedder())
+
+    assert result["reembed_count"] == 1
+    assert result["rebuild"] == {"action": "skip", "reason": "unchanged"}
+    assert rebuild_calls == []
+    assert _count_pending(store) == 0
+    assert len(store.db._label_map) == 1
+    assert store.db._hnsw.get_current_count() == 1

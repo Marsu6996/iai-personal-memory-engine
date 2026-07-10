@@ -1919,7 +1919,7 @@ async def main() -> int:
             _s4_offline_loop(store, shutdown)
         )
         cascade_task = asyncio.create_task(
-            _hippea_cascade_loop(store, shutdown)
+            _hippea_cascade_loop(store, shutdown, state_ref=state)
         )
 
         cpu_watchdog_task = asyncio.create_task(
@@ -2130,12 +2130,23 @@ async def main() -> int:
                             from iai_mcp import runtime_graph_cache as _rgc
 
                             def _run_wake_sequence():
+                                embedder_error = None
                                 try:
                                     _emb = embedder_for_store(store)
-                                except Exception:
+                                except Exception as exc:
                                     _emb = None
+                                    embedder_error = type(exc).__name__
                                 result = store.db.pending_embeddings_wake_sequence(embedder=_emb)
-                                if result.get("action") != "skip":
+                                result["embedder_available"] = _emb is not None
+                                if embedder_error is not None:
+                                    result["embedder_error"] = embedder_error
+                                changed = (
+                                    int(result.get("reembed_count", 0) or 0) > 0
+                                    or int(result.get("ingest_count", 0) or 0) > 0
+                                    or (result.get("rebuild") or {}).get("action") == "rebuild"
+                                )
+                                result["changed"] = changed
+                                if changed:
                                     try:
                                         _rgc.invalidate(store)
                                     except Exception:
@@ -2143,10 +2154,23 @@ async def main() -> int:
                                 return result
 
                             _wake_seq_result = await asyncio.to_thread(_run_wake_sequence)
-                            if (
+                            if isinstance(_wake_seq_result, dict):
+                                try:
+                                    await asyncio.to_thread(
+                                        write_event,
+                                        store,
+                                        "pending_embeddings_wake_sequence",
+                                        _wake_seq_result,
+                                        severity="info",
+                                    )
+                                except Exception:  # noqa: BLE001 -- observability only
+                                    log.debug("wake sequence event write failed", exc_info=True)
+
+                            _wake_seq_changed = (
                                 isinstance(_wake_seq_result, dict)
-                                and _wake_seq_result.get("action") != "skip"
-                            ):
+                                and bool(_wake_seq_result.get("changed"))
+                            )
+                            if _wake_seq_changed:
                                 try:
                                     _kick_drowsy_rgc_rebuild(store)
                                 except Exception:  # noqa: BLE001 -- best-effort

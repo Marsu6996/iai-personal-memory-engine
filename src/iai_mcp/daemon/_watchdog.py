@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import faulthandler
 import json
 import logging
@@ -133,7 +134,11 @@ _daemon_started_monotonic: float | None = None
 
 
 async def _hippea_cascade_loop(
-    store, shutdown: asyncio.Event, *, _clock=time.monotonic,
+    store,
+    shutdown: asyncio.Event,
+    *,
+    state_ref: dict | None = None,
+    _clock=time.monotonic,
 ) -> None:
     from iai_mcp.daemon_state import load_state, save_state
     from iai_mcp.hippea_cascade import _install_warm, compute_and_fetch_warm
@@ -143,7 +148,7 @@ async def _hippea_cascade_loop(
 
     while not shutdown.is_set():
         try:
-            state = await asyncio.to_thread(load_state)
+            state = state_ref if state_ref is not None else await asyncio.to_thread(load_state)
             req = state.get("hippea_cascade_request") or {}
             if req.get("pending"):
                 elapsed = _clock() - _pkg()._last_cascade_completed_at
@@ -206,9 +211,10 @@ async def _hippea_cascade_loop(
                         except (OSError, RuntimeError) as exc:
                             log.debug("hippea_cascade_completed event write failed: %s", exc)
                         try:
-                            state = await asyncio.to_thread(load_state)
+                            if state_ref is None:
+                                state = await asyncio.to_thread(load_state)
                             state["hippea_cascade_request"] = {"pending": False}
-                            await asyncio.to_thread(save_state, state)
+                            await asyncio.to_thread(save_state, copy.deepcopy(state))
                         except (OSError, ValueError) as exc:
                             log.debug("cascade state clear failed: %s", exc)
                     finally:
