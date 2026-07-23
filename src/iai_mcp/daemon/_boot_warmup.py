@@ -1,4 +1,4 @@
-"""Write-free boot warm-up: builds the cold storage-engine indexes at WAKE.
+"""Boot warm-up: builds the cold storage-engine indexes at WAKE.
 
 A cold storage engine pays a per-process index-build cost the first time it
 sees each distinct query shape (an ANN candidate fetch, the resident
@@ -8,11 +8,9 @@ fires those same query shapes once, read-only, as a background task right
 after the socket comes up, so the indexes are already warm by the time a
 real recall arrives.
 
-Write-free by construction: every shape below calls a read surface on the
-store directly. Nothing here goes through the write/dispatch path — no
-reinforcement is queued, no event is written, nothing is captured. The only
-side effect is a small diagnostics sidecar (elapsed-ms per shape) written at
-the store root, which never contains record content or embeddings.
+Nothing here goes through the record write/dispatch path — no reinforcement
+is queued, no event is written, nothing is captured. Side effects are the
+diagnostics sidecar and the explicit plaintext lexical-index sidecar.
 
 Fail-safe: any exception while probing one shape is recorded and the
 remaining shapes still run; an empty or degenerate corpus is a no-op, not a
@@ -191,6 +189,21 @@ def run_boot_warmup(
 
     if warm_dispatch:
         shapes["dispatch_surface"] = warm_dispatch_surface(store)
+
+    # The lexical sidecar is loaded or built at boot, never synchronously by a
+    # recall. Captures update the warm index incrementally afterward.
+    _t0 = time.perf_counter()
+    try:
+        lexical = store.warm_lexical_index()
+        shapes["lexical_index"] = {
+            "elapsed_ms": (time.perf_counter() - _t0) * 1000.0,
+            **lexical,
+        }
+    except Exception as exc:  # noqa: BLE001 -- semantic recall remains available
+        shapes["lexical_index"] = {
+            "elapsed_ms": (time.perf_counter() - _t0) * 1000.0,
+            "error": str(exc)[:200],
+        }
 
     try:
         probes = _sample_probe_embeddings(store, probe_count)

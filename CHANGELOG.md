@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1+m2] — 2026-07-23
+
+### Added
+
+- **IDF-gated hybrid recall.** Rare French query tokens (IDF ≥ 4), including
+  deterministic synonym expansions, activate BM25 candidates and reciprocal
+  rank fusion before the existing M1 source weighting. The existing lexical
+  index now persists as a mode-600 plaintext JSONL sidecar, warms at boot,
+  updates incrementally on capture, and can be rebuilt with
+  `iai lexical-rebuild`. Set `IAI_MCP_HYBRID_LEXICAL=0` to disable it; tune
+  fusion with `IAI_MCP_HYBRID_RRF_K` (10–1000, default 240, selected from the
+  2026-07-23 production gold sweep) and the gate with
+  `IAI_MCP_HYBRID_IDF_GATE` (1.0–10.0, default 4.0).
+
 ## [2.5.1+m1] — 2026-07-23
 
 ### Added

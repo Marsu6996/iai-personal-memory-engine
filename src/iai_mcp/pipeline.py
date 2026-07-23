@@ -21,6 +21,7 @@ from iai_mcp.exceptions import (
 )
 from iai_mcp.graph import MemoryGraph
 from iai_mcp.source_weighting import source_weight_factor, source_weighted_score
+from iai_mcp.store._lexical_index import RRF_K, hybrid_rrf_k, reciprocal_rank_fusion
 from iai_mcp.store import MemoryStore
 from iai_mcp.types import MemoryHit, RecallResponse
 
@@ -128,6 +129,8 @@ class _RecallCoreResult:
     cue_mode: str = "concept"
     budget_used: int = 0
     _records_cache: dict = field(default_factory=dict)
+    _hybrid_scores: dict[UUID, float] = field(default_factory=dict)
+    _hybrid_rrf_k: float = RRF_K
 
 
 PROFILE_SENTINEL_UUID = UUID("00000000-0000-0000-0000-0000000000f1")
@@ -786,6 +789,25 @@ def _recall_core(
             )
         }
 
+    # M2 asks the existing lexical index only for an IDF-rare cue. A cold
+    # index schedules its boot build and returns semantic-only immediately.
+    hybrid_rrf_k_value = hybrid_rrf_k()
+    hybrid_gate_fired = False
+    hybrid_lexical_pairs: list[tuple[UUID, float]] = []
+    try:
+        hybrid_gate_fired, hybrid_lexical_pairs, _hybrid_max_idf = (
+            store.hybrid_lexical_search_ids(cue, k=K_CANDIDATES)
+        )
+    except Exception as exc:  # noqa: BLE001 -- lexical lane is fail-soft
+        logger.debug("hybrid_lexical_candidates_failed: %s", exc)
+    if hybrid_lexical_pairs:
+        missing = [rid for rid, _score in hybrid_lexical_pairs if rid not in records_cache]
+        if missing:
+            try:
+                records_cache.update(store.get_batch(missing))
+            except Exception as exc:  # noqa: BLE001 -- semantic lane remains intact
+                logger.debug("hybrid_lexical_batch_failed: %s", exc)
+
     episodic_ids: set | None = None
     if mode == "verbatim":
         episodic_ids = {
@@ -804,6 +826,26 @@ def _recall_core(
 
     _pool_t0 = time.perf_counter()
     pool_ids, pool_embs = _collect_graph_pool(graph, records_cache, store)
+    if hybrid_lexical_pairs:
+        existing_pool_ids = set(pool_ids)
+        lexical_extra_ids = [
+            rid
+            for rid, _score in hybrid_lexical_pairs
+            if rid not in existing_pool_ids
+            and rid in records_cache
+            and getattr(records_cache[rid], "embedding", None)
+        ]
+        if lexical_extra_ids:
+            lexical_extra_embs = np.asarray(
+                [records_cache[rid].embedding for rid in lexical_extra_ids],
+                dtype=np.float32,
+            )
+            pool_ids = list(pool_ids) + lexical_extra_ids
+            pool_embs = (
+                np.concatenate([pool_embs, lexical_extra_embs], axis=0)
+                if pool_embs.size
+                else lexical_extra_embs
+            )
     _recall_pool_collection_ms = (time.perf_counter() - _pool_t0) * 1000.0
     cue_vec = _sanitize_vec(np.asarray(cue_emb, dtype=np.float32))
     cnorm = float(np.linalg.norm(cue_vec))
@@ -940,6 +982,14 @@ def _recall_core(
             _arousal_mode_bias_adjust = 0.0
 
     id_to_idx = {rid: i for i, rid in enumerate(pool_ids)}
+    hybrid_lexical_ranked_ids = [
+        rid for rid, _score in hybrid_lexical_pairs if rid in id_to_idx
+    ]
+    hybrid_active = hybrid_gate_fired and bool(hybrid_lexical_ranked_ids)
+    lexical_indices = np.array(
+        [id_to_idx[rid] for rid in hybrid_lexical_ranked_ids],
+        dtype=np.int64,
+    )
 
     gate_member_embeddings: dict[UUID, np.ndarray] = {
         pool_ids[i]: pool_embs[i]
@@ -1021,10 +1071,18 @@ def _recall_core(
             rich_indices = rich_indices[
                 shared_cos[rich_indices] >= _arousal_rank_threshold_used
             ]
-    if cosine_top_indices.size or spread_indices.size or rich_indices.size:
+    if (
+        cosine_top_indices.size
+        or spread_indices.size
+        or rich_indices.size
+        or lexical_indices.size
+    ):
         reachable_indices = np.union1d(
-            np.union1d(cosine_top_indices, spread_indices),
-            rich_indices,
+            np.union1d(
+                np.union1d(cosine_top_indices, spread_indices),
+                rich_indices,
+            ),
+            lexical_indices,
         ).astype(np.int64)
     else:
         reachable_indices = np.empty(0, dtype=np.int64)
@@ -1180,7 +1238,7 @@ def _recall_core(
                 s *= (1.0 + _valence)
             if cue and rec.literal_surface and _trigram_jaccard(cue.lower(), rec.literal_surface.lower()) > 0.3:
                 s *= 2.0
-            if fts_hits and cid in fts_hits:
+            if not hybrid_active and fts_hits and cid in fts_hits:
                 s *= 3.0
             if cue_intent == "historical_verbatim" and contradicts_dst_set:
                 if str(cid) in contradicts_dst_set:
@@ -1210,6 +1268,22 @@ def _recall_core(
                 tgt = anchor_target.get(str(row[1]))
                 if tgt is not None and row[0] < tgt:
                     scored[j] = (tgt,) + row[1:]
+
+    hybrid_fused_scores: dict[UUID, float] = {}
+    if hybrid_active and scored:
+        semantic_ids = [
+            row[1]
+            for row in sorted(scored, key=lambda row: (-row[0], str(row[1])))
+        ]
+        hybrid_fused_scores = reciprocal_rank_fusion(
+            semantic_ids,
+            hybrid_lexical_ranked_ids,
+            k=hybrid_rrf_k_value,
+        )
+        scored = [
+            (hybrid_fused_scores[row[1]],) + row[1:]
+            for row in scored
+        ]
 
     # M1 source weighting is a final score adjustment, never an eligibility
     # gate. Candidate records already carry tier + tags from the batched vector /
@@ -1319,6 +1393,8 @@ def _recall_core(
         cue_mode=mode,
         budget_used=budget_used,
         _records_cache=records_cache,
+        _hybrid_scores=hybrid_fused_scores,
+        _hybrid_rrf_k=hybrid_rrf_k_value,
     )
 
 
@@ -1721,6 +1797,8 @@ def recall_for_response(
         hints=hints,
         cue_mode=core.cue_mode,
         patterns_observed=patterns_observed,
+        _hybrid_scores=core._hybrid_scores,
+        _hybrid_rrf_k=core._hybrid_rrf_k,
     )
 
 

@@ -147,6 +147,8 @@ class RecallResponse:
     cue_mode: str = "concept"
     patterns_observed: list[dict] = field(default_factory=list)
     ann_path_used: bool = False
+    _hybrid_scores: dict[UUID, float] = field(default_factory=dict, repr=False)
+    _hybrid_rrf_k: float = field(default=240.0, repr=False)
 
 
 @dataclass

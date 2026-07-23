@@ -307,6 +307,16 @@ class MemoryStore:
         if _register_adjust is not None:
             _register_adjust(_adjust_corpus_count_via_weakref)
 
+        # One lexical index serves both scoped search and M2 recall. Its
+        # plaintext JSONL sidecar is loaded/built by boot warm-up, never by a
+        # banal recall; capture feeds it incrementally once warm.
+        from iai_mcp.store._lexical_index import (
+            INDEX_FILENAME as _LEXICAL_INDEX_FILENAME,
+            LexicalIndex as _LexicalIndex,
+        )
+        self._lexical_idx = _LexicalIndex(self.root / _LEXICAL_INDEX_FILENAME)
+        self._lexical_build_scheduled = False
+
         # Resident exact-cosine authority: the object is constructed eagerly so
         # the write seams below always have somewhere to feed, but the matrix
         # itself stays cold until the first exact_top_k call (lazy build keeps
@@ -345,6 +355,11 @@ class MemoryStore:
             self._corpus_count_cache.invalidate(*keys)
         except Exception:  # noqa: BLE001
             pass
+        if "active" in keys or "pending" in keys:
+            try:
+                self._lexical_idx.invalidate()
+            except (AttributeError, TypeError):
+                pass
 
     def _adjust_corpus_count(self, key: str, delta: int) -> None:
         """Shift one cached corpus count by a known-exact write delta.
@@ -634,6 +649,15 @@ class MemoryStore:
         self._graph_sync_hook = hook
 
     def _fire_graph_sync_hook(self, op: str, record: MemoryRecord) -> None:
+        try:
+            if op == "delete":
+                self._lexical_idx.remove(str(record.id))
+            else:
+                self._lexical_idx.upsert(
+                    str(record.id), getattr(record, "literal_surface", "") or "",
+                )
+        except Exception as exc:  # noqa: BLE001 -- index maintenance is fail-soft
+            logger.debug("lexical_index_feed failed op=%s: %s", op, exc)
         hook = self._graph_sync_hook
         if hook is None:
             return
@@ -761,6 +785,10 @@ class MemoryStore:
 
         Failures are logged-and-swallowed for hook isolation.
         """
+        try:
+            self._lexical_idx.upsert(record_id, literal_surface)
+        except Exception as exc:  # noqa: BLE001 -- index maintenance is fail-soft
+            logger.debug("lexical_pending_feed failed id=%s: %s", record_id, exc)
         try:
             import json as _json
             from iai_mcp.store._recency_buffer import RecencyMarker as _RecencyMarker
@@ -2116,55 +2144,67 @@ class MemoryStore:
             # next caller's kick; never breaks the caller.
             logger.debug("exact-index build scheduling failed", exc_info=True)
 
+    def warm_lexical_index(self, *, force_rebuild: bool = False) -> dict:
+        """Load the plaintext sidecar, or rebuild it from decrypted records."""
+        idx = self._lexical_idx
+        with idx.build_lock:
+            expected = self.active_records_count() + self.pending_records_count()
+            if not force_rebuild and idx.ready and idx.document_count == expected:
+                return {"documents": idx.document_count, "rebuilt": False}
+            if (
+                not force_rebuild
+                and not idx.ready
+                and idx.load()
+                and idx.document_count == expected
+            ):
+                return {"documents": idx.document_count, "rebuilt": False}
+
+            ids: list[UUID] = []
+            for row in self.iter_record_columns(
+                ["id"],
+                batch_size=2048,
+                where="tombstoned_at IS NULL",
+            ):
+                try:
+                    ids.append(UUID(str(row["id"])))
+                except (TypeError, ValueError):
+                    continue
+            rows: list[tuple[str, str]] = []
+            for start in range(0, len(ids), 400):
+                batch = self.get_batch(ids[start : start + 400])
+                rows.extend(
+                    (str(rid), rec.literal_surface or "")
+                    for rid, rec in batch.items()
+                )
+            idx.build(rows)
+            return {"documents": idx.document_count, "rebuilt": True}
+
+    def schedule_lexical_index_warm(self) -> None:
+        """Build a cold index off the recall thread, once."""
+        if self._lexical_idx.ready or self._lexical_build_scheduled:
+            return
+        self._lexical_build_scheduled = True
+
+        def _warm() -> None:
+            try:
+                self.warm_lexical_index()
+            except Exception:  # noqa: BLE001 -- cold recall stays semantic-only
+                logger.debug("lexical index background warm failed", exc_info=True)
+            finally:
+                self._lexical_build_scheduled = False
+
+        threading.Thread(
+            target=_warm,
+            name="lexical-index-build",
+            daemon=True,
+        ).start()
+
     def lexical_search(
         self, query: str, k: int = 10,
     ) -> "list[tuple[MemoryRecord, float]]":
-        """Identifier-grade lexical lane over decrypted surfaces (in RAM only).
-
-        Complements the semantic lane where embeddings are weakest: exact
-        code identifiers and env names. Rebuilds on demand when the corpus
-        generation moved; surfaces are write-once verbatim, so a generation
-        keyed on corpus-changing writes is a sufficient freshness fence.
-        Never used on the recall critical path — this is the scoped-search
-        surface (MCP memory_search / CLI)."""
-        from iai_mcp.store._lexical_index import LexicalIndex
-
-        idx = getattr(self, "_lexical_idx", None)
-        if idx is None:
-            idx = LexicalIndex()
-            self._lexical_idx = idx
-        try:
-            gen = self._corpus_count_cache.generation()
-        except Exception:  # noqa: BLE001
-            gen = None
-        if idx.generation is None or idx.generation != gen:
-            # Single-flight: the rebuild decrypts the whole corpus; a second
-            # concurrent search waits here and finds the fresh generation.
-            with idx.build_lock:
-                if idx.generation is None or idx.generation != gen:
-                    ids: list[UUID] = []
-                    # Pending-embed rows ARE included: the lexical lane needs
-                    # only the decrypted surface, never the vector, so a
-                    # captured-but-not-yet-embedded row must be findable by
-                    # exact identifier immediately.
-                    for row in self.iter_record_columns(
-                        ["id"],
-                        batch_size=2048,
-                        where="tombstoned_at IS NULL",
-                    ):
-                        try:
-                            ids.append(UUID(str(row["id"])))
-                        except (TypeError, ValueError):
-                            continue
-                    rows: list[tuple[str, str]] = []
-                    for i in range(0, len(ids), 400):
-                        batch = self.get_batch(ids[i : i + 400])
-                        rows.extend(
-                            (str(rid), rec.literal_surface or "")
-                            for rid, rec in batch.items()
-                        )
-                    idx.build(rows, gen)
-        pairs = idx.query(query, k=k)
+        """BM25 lane used by scoped search; ensures the sidecar is current."""
+        self.warm_lexical_index()
+        pairs = self._lexical_idx.query(query, k=k)
         if not pairs:
             return []
         recs = self.get_batch(
@@ -2176,6 +2216,35 @@ class MemoryStore:
             if rec is not None:
                 out.append((rec, score))
         return out
+
+    def hybrid_lexical_search_ids(
+        self, query: str, k: int = 200,
+    ) -> "tuple[bool, list[tuple[UUID, float]], float]":
+        """IDF-gated BM25 candidates for recall; never builds synchronously."""
+        if os.environ.get("IAI_MCP_HYBRID_LEXICAL", "1") == "0":
+            return False, [], 0.0
+        if not self._lexical_idx.ready:
+            self.schedule_lexical_index_warm()
+            return False, [], 0.0
+        from iai_mcp.store._lexical_index import hybrid_idf_gate
+
+        gated, pairs, max_idf = self._lexical_idx.gated_query(
+            query,
+            k=k,
+            threshold=hybrid_idf_gate(),
+        )
+        return (
+            gated,
+            [
+                (uid, score)
+                for rid, score in pairs
+                if (uid := self._maybe_uuid(rid)) is not None
+            ],
+            max_idf,
+        )
+
+    def rebuild_lexical_index(self) -> dict:
+        return self.warm_lexical_index(force_rebuild=True)
 
     @staticmethod
     def _maybe_uuid(value: str) -> "UUID | None":

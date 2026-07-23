@@ -1223,6 +1223,32 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lexical_rebuild(args: argparse.Namespace) -> int:
+    """Rebuild the plaintext lexical sidecar in the store-owning process."""
+    result = None
+    if _daemon_alive():
+        relayed = _relay_rpc("lexical_rebuild", {}, timeout=900.0)
+        if _is_relay_failure(relayed):
+            print(
+                f"lexical rebuild failed: {relayed.get('reason', 'daemon error')}",
+                file=sys.stderr,
+            )
+            return 1
+        result = relayed
+    if result is None:
+        store = _open_store_shared_or_fail("lexical rebuild")
+        if store is None:
+            return 1
+        try:
+            result = store.rebuild_lexical_index()
+        finally:
+            store.close()
+    print(
+        f"lexical index rebuilt: {int(result.get('documents', 0))} documents"
+    )
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Keep studying a directory: restudy changed files, fade deleted ones.
     The live counterpart of `iai teach <dir>` — memory follows the tree.
@@ -1460,6 +1486,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--limit", type=int, default=8)
     p_search.add_argument("--json", action="store_true", default=False)
     p_search.set_defaults(func=cmd_search)
+
+    p_lexical_rebuild = sub.add_parser(
+        "lexical-rebuild",
+        help="Rebuild the plaintext BM25 index",
+    )
+    p_lexical_rebuild.set_defaults(func=cmd_lexical_rebuild)
 
     p_watch = sub.add_parser(
         "watch",

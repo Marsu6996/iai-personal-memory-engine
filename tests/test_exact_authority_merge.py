@@ -267,7 +267,12 @@ def _stub_embedder_for_store(monkeypatch, vec: list[float]) -> None:
     monkeypatch.setattr(_embed_mod, "embedder_for_store", lambda _store: _StubEmbedder(vec))
 
 
-def _dispatch_recall(store: MemoryStore, cue_vec: list[float], budget: int = 2000) -> dict:
+def _dispatch_recall(
+    store: MemoryStore,
+    cue_vec: list[float],
+    budget: int = 2000,
+    cue: str = "irrelevant text, embedder is stubbed",
+) -> dict:
     from iai_mcp import core as _core
     import iai_mcp.pipeline as _pm
 
@@ -279,11 +284,39 @@ def _dispatch_recall(store: MemoryStore, cue_vec: list[float], budget: int = 200
 
     _pm._last_recall_latency_ms = 0.0
     return _core.dispatch(store, "memory_recall", {
-        "cue": "irrelevant text, embedder is stubbed",
+        "cue": cue,
         "session_id": "authority-wiring-test",
         "budget_tokens": budget,
         "cue_embedding": cue_vec,
     })
+
+
+def test_hybrid_authority_uses_rrf_scale_before_m1(store, monkeypatch):
+    cue_vec = _seeded_vec(42)
+    target_id = uuid4()
+    store.insert(
+        _make_rec(
+            target_id,
+            seed=42,
+            surface="La politique semver gouverne chaque release.",
+            embedding=cue_vec,
+        )
+    )
+    flush_record_buffer(store)
+    store._lexical_idx.build(
+        [(str(target_id), "semver release")]
+        + [(str(uuid4()), f"commun document {i}") for i in range(99)]
+    )
+    _stub_embedder_for_store(monkeypatch, cue_vec)
+
+    resp = _dispatch_recall(store, cue_vec, cue="Quelle règle de versionnage ?")
+
+    target = next(h for h in resp["hits"] if h["record_id"] == str(target_id))
+    assert resp["exact_authority_used"] is True
+    assert 0.0 < target["score"] < 0.1, (
+        "hybrid authority must retain the RRF score scale; a raw cosine here "
+        "would override the lexical-semantic fusion"
+    )
 
 
 def test_authority_hit_surfaces_at_head_when_ann_tier_misses_it(store, monkeypatch):

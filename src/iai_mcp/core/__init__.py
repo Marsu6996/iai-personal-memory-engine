@@ -709,7 +709,11 @@ def dispatch(store: MemoryStore, method: str, params: dict) -> dict:
                             )
                             _auth_hits = []
                             _source_factor = source_weight_factor()
-                            for _rid, _acos in _authority_pairs:
+                            _hybrid_scores = getattr(resp, "_hybrid_scores", {})
+                            _hybrid_rrf_k = getattr(resp, "_hybrid_rrf_k", 240.0)
+                            for _auth_rank, (_rid, _acos) in enumerate(
+                                _authority_pairs, start=1,
+                            ):
                                 if str(_rid) not in _live_auth_ids:
                                     # not proven live by the id-set liveness
                                     # query -- must never surface as a hit
@@ -729,7 +733,16 @@ def dispatch(store: MemoryStore, method: str, params: dict) -> dict:
                                 _auth_hits.append(MemoryHit(
                                     record_id=_rid,
                                     score=source_weighted_score(
-                                        _acos, _arec, factor=_source_factor,
+                                        (
+                                            _hybrid_scores.get(
+                                                _rid,
+                                                1.0 / (_hybrid_rrf_k + _auth_rank),
+                                            )
+                                            if _hybrid_scores
+                                            else _acos
+                                        ),
+                                        _arec,
+                                        factor=_source_factor,
                                     ),
                                     reason="exact-cosine",
                                     literal_surface=_arec.literal_surface or "",
@@ -967,6 +980,9 @@ def dispatch(store: MemoryStore, method: str, params: dict) -> dict:
         if not isinstance(kwargs, dict):
             kwargs = {}
         return getattr(view_for_store(store), verb)(**kwargs)
+
+    if method == "lexical_rebuild":
+        return store.rebuild_lexical_index()
 
     if method == "memory_search":
         # Scoped hybrid search: a lexical (identifier-exact) lane beside the
